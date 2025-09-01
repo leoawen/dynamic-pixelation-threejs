@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cena Three.js com GUI para Efeito Pixel (Integrado)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000000; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+
+    <!-- Mapa de Importação para Módulos ES6 -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <!-- Código JavaScript Principal (Módulo ES6) -->
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+        import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+
+        // =====================================================================================
+        // FUNÇÃO DE CONTORNO
+        // Cria um contorno que reage à luz usando a técnica onBeforeCompile.
+        // É fisicamente correto e se integra perfeitamente com o pipeline do Three.js.
+        // =====================================================================================
+        function createUnifiedIlluminatedOutline(objectToOutline, options = {}) {
+            if (!objectToOutline) {
+                console.warn("createUnifiedIlluminatedOutline: Objeto para contorno é nulo.");
+                return;
+            }
+
+            const meshesToProcess = [];
+            objectToOutline.traverse(node => {
+                if (node.isMesh && (!options.exclude || !options.exclude.includes(node.name))) {
+                    meshesToProcess.push(node);
+                }
+            });
+
+            meshesToProcess.forEach(originalMesh => {
+                if (!originalMesh.parent) {
+                    console.error("Erro no contorno: A malha original deve ser adicionada à cena ANTES de chamar a função.", originalMesh);
+                    return;
+                }
+                const outlineMesh = originalMesh.clone();
+                outlineMesh.name = 'outline_mesh_iluminado';
+
+                const outlineMaterial = new THREE.MeshStandardMaterial({
+                    color: 0x000000,
+                    roughness: 1.0,
+                    metalness: 0.0,
+                    envMapIntensity: 0.0,
+                    side: THREE.BackSide,
+                    skinning: options.isSkinned || false,
+                });
+
+                outlineMaterial.onBeforeCompile = (shader) => {
+                    shader.uniforms.thickness = { value: options.thickness || 0.03 };
+                    shader.vertexShader = 'uniform float thickness;\n' + shader.vertexShader;
+                    shader.vertexShader = shader.vertexShader.replace(
+                        '#include <begin_vertex>',
+                        [
+                            '#include <begin_vertex>',
+                            'transformed += normalize(objectNormal) * thickness;',
+                        ].join('\n')
+                    );
+                };
+                outlineMesh.material = outlineMaterial;
+                originalMesh.parent.add(outlineMesh);
+            });
+        }
+
+        // =====================================================================================
+        // CLASSE `RenderPixelatedPass` - O CORAÇÃO DO EFEITO
+        // Esta classe encapsula toda a lógica do passe de pós-processamento.
+        // =====================================================================================
+        class RenderPixelatedPass extends Pass {
+            constructor( initialPixelSize, scene, camera, options = {} ) {
+                super();
+                this.pixelSize = initialPixelSize;
+                this.scene = scene;
+                this.camera = camera;
+                this.pixelatedMaterial = this.createPixelatedMaterial();
+                this.fsQuad = new FullScreenQuad( this.pixelatedMaterial );
+
+                // Configura um "render target", que é uma textura para a qual a cena principal
+                // será desenhada antes do nosso efeito ser aplicado.
+                this.beautyRenderTarget = new THREE.WebGLRenderTarget();
+                this.beautyRenderTarget.texture.minFilter = THREE.NearestFilter;
+                this.beautyRenderTarget.texture.magFilter = THREE.NearestFilter;
+                this.beautyRenderTarget.texture.type = THREE.HalfFloatType;
+                
+                // ESSENCIAL: Habilita a criação de uma textura de profundidade (`tDepth`),
+                // que será lida pelo nosso shader para a lógica dinâmica.
+                this.beautyRenderTarget.depthTexture = new THREE.DepthTexture();
+                this.beautyRenderTarget.depthTexture.type = THREE.UnsignedInt248Type;
+            }
+
+            dispose() {
+                this.beautyRenderTarget.dispose();
+                this.pixelatedMaterial.dispose();
+                this.fsQuad.dispose();
+            }
+
+            setSize( width, height ) {
+                this.beautyRenderTarget.setSize( width, height );
+                this.pixelatedMaterial.uniforms.resolution.value.set(width, height);
+            }
+
+            render( renderer, writeBuffer ) {
+                // 1. Renderiza a cena para a nossa textura, que agora também captura profundidade.
+                renderer.setRenderTarget( this.beautyRenderTarget );
+                renderer.render( this.scene, this.camera );
+
+                // 2. Passa as texturas (cor e profundidade) para o nosso shader como uniforms.
+                this.fsQuad.material.uniforms.tDiffuse.value = this.beautyRenderTarget.texture;
+                this.fsQuad.material.uniforms.tDepth.value = this.beautyRenderTarget.depthTexture;
+
+                // 3. Renderiza o resultado (o quad de tela cheia com nosso shader) na tela ou no próximo buffer.
+                if ( this.renderToScreen ) {
+                    renderer.setRenderTarget( null );
+                } else {
+                    renderer.setRenderTarget( writeBuffer );
+                    if ( this.clear ) renderer.clear();
+                }
+                this.fsQuad.render( renderer );
+            }
+
+            createPixelatedMaterial() {
+                return new THREE.ShaderMaterial({
+                    // AJUSTE P/ LOGDEPTHBUF (1/2): Define as diretivas para o pré-processador GLSL.
+                    // Isso "liga" os blocos de código #ifdef USE_LOGDEPTHBUF dentro dos chunks do Three.js,
+                    // garantindo que o shader esteja ciente do modo de profundidade logarítmica.
+                    defines: {
+                        'USE_LOGDEPTHBUF': '',
+                        'USE_LOGDEPTHBUF_EXT': ''
+                    },
+                    uniforms: {
+                        "tDiffuse": { value: null }, // Textura da cena colorida.
+                        "tDepth": { value: null },   // Textura de profundidade da cena.
+                        "resolution": { value: new THREE.Vector2() }, // Resolução da tela.
+                    },
+                    vertexShader: /* glsl */`
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+                        }`,
+
+                    // SHADER PRINCIPAL: Contém toda a lógica de pixelização e preservação de silhueta.
+                    fragmentShader: /* glsl */`
+                        uniform sampler2D tDiffuse;
+                        uniform sampler2D tDepth;
+                        uniform vec2 resolution;
+
+                        varying vec2 vUv;
+                        
+                        void main() {
+                            // --- LÓGICA DE PRESERVAÇÃO DE SILHUETA ---
+
+                            // 1. AMOSTRAGEM DE VIZINHANÇA: Em vez de ler a profundidade em apenas um ponto,
+                            // lemos em uma área 2x2 para encontrar o objeto mais próximo.
+                            vec2 texelSize = 1.0 / resolution;
+                            float depth_top_left     = texture2D(tDepth, vUv).r;
+                            float depth_top_right    = texture2D(tDepth, vUv + vec2(texelSize.x, 0.0)).r;
+                            float depth_bottom_left  = texture2D(tDepth, vUv + vec2(0.0, texelSize.y)).r;
+                            float depth_bottom_right = texture2D(tDepth, vUv + texelSize).r;
+
+                            // 2. ENCONTRAR A PROFUNDIDADE MÍNIMA: Usamos min() para pegar o valor de profundidade
+                            // mais baixo (mais perto da câmera) entre as 4 amostras.
+                            float closestDepth = min(depth_top_left, min(depth_top_right, min(depth_bottom_left, depth_bottom_right)));
+
+                            // --- LÓGICA DE PIXELIZAÇÃO DINÂMICA ---
+
+                            // 3. DECIDIR O TAMANHO DO PIXEL: Usamos a profundidade mais próxima ('closestDepth')
+                            // para determinar o tamanho do bloco de pixel.
+                            float dynamicPixelSize;
+
+                            // ** PONTO DE CALIBRAÇÃO DO ARTISTA **
+                            // Ajuste estes valores de 'closestDepth' (que vão de 0.0 a 1.0) para definir
+                            // as faixas de pixelização. Use a depuração visual (tons de cinza) para encontrar os valores ideais.
+                            if (closestDepth < 0.05) {
+                                dynamicPixelSize = 6.0;
+                            } else if (closestDepth < 0.1) {
+                                dynamicPixelSize = 5.0;
+                            } else if (closestDepth < 0.15) {
+                                dynamicPixelSize = 4.0;
+                            } else if (closestDepth < 0.2) {
+                                dynamicPixelSize = 3.0;
+                            } else {
+                                dynamicPixelSize = 2.0;
+                            }
+
+                            // 4. CRIAR O EFEITO: Mapeamos a coordenada UV para uma grade, cujo tamanho é definido
+                            // por 'dynamicPixelSize'. Isso cria os "blocos" de pixel.
+                            vec2 pixelatedUv = floor(vUv * resolution / dynamicPixelSize) * dynamicPixelSize / resolution;
+                            gl_FragColor = texture2D(tDiffuse, pixelatedUv);
+                        }`
+                });
+            }
+        }
+
+        // =========================================================================
+        // INICIALIZAÇÃO DA CENA
+        // =========================================================================
+        let scene, camera, renderer, controls, composer, pixelPass;
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 20000);
+            camera.position.set(-1.5, 1.5, -3.5);
+            //camera.lookAt(0, 3, 0);
+            
+            // AJUSTE P/ LOGDEPTHBUF (2/2): Habilita o buffer de profundidade logarítmico no renderer.
+            // Este é o gatilho principal para todo o sistema.
+            renderer = new THREE.WebGLRenderer({ 
+                antialias: true,
+                logarithmicDepthBuffer: true
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap; 
+
+            document.body.appendChild(renderer.domElement);
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.target.set(0, 3, 0);
+            scene.background = new THREE.Color(0x87ceeb);
+
+            const hdrLoader = new RGBELoader();
+            hdrLoader.load('https://dl.dropboxusercontent.com/scl/fi/c3iswf8iot8ep89jcup2t/golden_gate_hills_1k.hdr?rlkey=wlzj9qtcfxrwerezfnw038m0w', function(texture) {
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+                scene.environment = texture;
+            });
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 5);
+            directionalLight.position.set(3000, 9000, 3000);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            scene.add(directionalLight);
+
+            // Configuração do Pós-Processamento
+            composer = new EffectComposer(renderer);
+            pixelPass = new RenderPixelatedPass(16, scene, camera);
+            composer.addPass(pixelPass);
+            const outputPass = new OutputPass();
+            composer.addPass(outputPass);
+            
+            const loader = new GLTFLoader();
+            loader.load('https://dl.dropboxusercontent.com/scl/fi/zjh2bdmx9kuvqktjij73r/4-Dire-es-NEW-VIBE_WEAVERS-Modelo.glb?rlkey=9d8uruv9kfaxyyezzkmzvucg1', function (gltf) {
+                const model = gltf.scene;
+                directionalLight.target = model;
+                scene.add(directionalLight.target);
+                
+                model.traverse(function (node) {
+                    if (node.isMesh) {
+                        node.castShadow = true;
+                        node.receiveShadow = true;
+                        if (Array.isArray(node.material)) {
+                            node.material.forEach(mat => mat.side = THREE.FrontSide);
+                        } else {
+                            node.material.side = THREE.FrontSide;
+                        }
+                    }
+                });
+                scene.add(model);
+                createUnifiedIlluminatedOutline(model, { thickness: 0.03 });
+            });
+
+            window.addEventListener('resize', onWindowResize, false);
+            animate();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            composer.render();
+        }
+
+        init();
+    </script>
+</body>
+</html>
