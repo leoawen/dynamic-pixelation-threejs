@@ -243,7 +243,7 @@
             scene.background = new THREE.Color(0x87ceeb);
 
             const hdrLoader = new RGBELoader();
-            hdrLoader.load('https://dl.dropboxusercontent.com/scl/fi/c3iswf8iot8ep89jcup2t/golden_gate_hills_1k.hdr?rlkey=wlzj9qtcfxrwerezfnw038m0w', function(texture) {
+            hdrLoader.load('assets/golden_gate_hills_1k.hdr', function(texture) {
                 texture.mapping = THREE.EquirectangularReflectionMapping;
                 scene.environment = texture;
             });
@@ -263,7 +263,7 @@
             composer.addPass(outputPass);
             
             const loader = new GLTFLoader();
-            loader.load('https://dl.dropboxusercontent.com/scl/fi/zjh2bdmx9kuvqktjij73r/4-Dire-es-NEW-VIBE_WEAVERS-Modelo.glb?rlkey=9d8uruv9kfaxyyezzkmzvucg1', function (gltf) {
+            loader.load('assets/scenario-glb.glb', function (gltf) {
                 const model = gltf.scene;
                 directionalLight.target = model;
                 scene.add(directionalLight.target);
